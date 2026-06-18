@@ -63,12 +63,16 @@ int main() {
     std :: vector<int> clients;
 
     while (true) {
-        // Try to accept a new connection; EAGAIN means none waiting right now.
-        int client_fd = accept(listen_fd, nullptr, nullptr);
-        if (client_fd < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
-                perror("accept");
-        } else {
+        // Drain the entire backlog queue before servicing clients.
+        // Since listen_fd is non-blocking, accept() returns EAGAIN once the
+        // queue is empty — that's our signal to stop and move on.
+        while (true) {
+            int client_fd = accept(listen_fd, nullptr, nullptr);
+            if (client_fd < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    perror("accept");
+                break;
+            }
             set_nonblocking(client_fd);
             clients.push_back(client_fd);
             std::cout << "client connected (fd " << client_fd << ")\n";
