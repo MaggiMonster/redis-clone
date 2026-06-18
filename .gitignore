@@ -1,0 +1,14 @@
+# compiled binary
+server
+
+# object files / build output
+*.o
+*.out
+*.dSYM/
+
+# build directories
+build/
+cmake-build-*/
+
+# macOS
+.DS_Store
