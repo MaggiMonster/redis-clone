@@ -37,10 +37,10 @@ int main() {
     // 2. Allow immediate reuse of the port after restart.
     //    Without SO_REUSEADDR, the OS holds the port in TIME_WAIT for a minute
     //    or two after the server exits, and rebinding fails with EADDRINUSE.
-    //int yes = 1;
-    //if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-    //    perror("setsockopt"); exit(1);
-    //}
+    int yes = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
+        perror("setsockopt"); exit(1);
+    }
 
     // 3. Describe the address we want to bind to.
     sockaddr_in addr;
