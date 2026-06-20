@@ -1,5 +1,8 @@
 # compiled binary
 server
+nonblocking_server
+kevent_server
+blocking_server
 
 # object files / build output
 *.o
