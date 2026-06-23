@@ -75,7 +75,6 @@ int main() {
     std::cout << "listening on 0.0.0.0:" << PORT << '\n';
 
     struct kevent events[MAX_EVTS];
-
     while (true) {
         // Block until at least one fd is ready.
         int n = kevent(kq, nullptr, 0, events, MAX_EVTS, nullptr);
