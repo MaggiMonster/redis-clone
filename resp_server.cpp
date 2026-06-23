@@ -14,6 +14,8 @@
 // Run:            ./resp_server
 // Test:           redis-cli -p 6379 ping
 //                 redis-cli -p 6379 echo hello
+//                 redis-cli -p 6379 set foo bar
+//                 redis-cli -p 6379 get foo
 // ============================================================================
 #include <sys/socket.h>
 #include <sys/event.h>
@@ -75,6 +77,7 @@ bool parse_command(std::string& buf, std::vector<std::string>& args) {
     int nargs;
     try { nargs = std::stoi(buf.substr(1, crlf - 1)); }
     catch (...) { return false; }
+    if (nargs < 0) return false;   // *-1 null array — not a valid command
     pos = crlf + 2;
 
     std::vector<std::string> out;
@@ -89,6 +92,7 @@ bool parse_command(std::string& buf, std::vector<std::string>& args) {
         int len;
         try { len = std::stoi(buf.substr(pos + 1, crlf - pos - 1)); }
         catch (...) { return false; }
+        if (len < 0) return false;  // $-1 null bulk — guard before size_t cast
         pos = crlf + 2;
 
         // <arg>\r\n
@@ -103,10 +107,22 @@ bool parse_command(std::string& buf, std::vector<std::string>& args) {
 }
 
 // ---------------------------------------------------------------------------
-// Command dispatcher — add SET/GET/DEL etc. here in Phase 4
+// RESP response helpers
 // ---------------------------------------------------------------------------
 
-std::string handle_command(const std::vector<std::string>& args) {
+static std::string make_bulk(const std::string& s) {
+    return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
+}
+
+static const std::string NULL_BULK  = "$-1\r\n";
+static const std::string OK         = "+OK\r\n";
+
+// ---------------------------------------------------------------------------
+// Command dispatcher
+// ---------------------------------------------------------------------------
+
+std::string handle_command(const std::vector<std::string>& args,
+                           std::unordered_map<std::string, std::string>& store) {
     if (args.empty()) return "-ERR empty command\r\n";
 
     std::string cmd = args[0];
@@ -114,12 +130,25 @@ std::string handle_command(const std::vector<std::string>& args) {
 
     if (cmd == "PING") {
         if (args.size() == 1) return "+PONG\r\n";
-        return "$" + std::to_string(args[1].size()) + "\r\n" + args[1] + "\r\n";
+        return make_bulk(args[1]);
     }
 
     if (cmd == "ECHO") {
         if (args.size() < 2) return "-ERR wrong number of arguments for 'echo'\r\n";
-        return "$" + std::to_string(args[1].size()) + "\r\n" + args[1] + "\r\n";
+        return make_bulk(args[1]);
+    }
+
+    if (cmd == "SET") {
+        if (args.size() < 3) return "-ERR wrong number of arguments for 'set'\r\n";
+        store[args[1]] = args[2];
+        return OK;
+    }
+
+    if (cmd == "GET") {
+        if (args.size() < 2) return "-ERR wrong number of arguments for 'get'\r\n";
+        auto it = store.find(args[1]);
+        if (it == store.end()) return NULL_BULK;
+        return make_bulk(it->second);
     }
 
     return "-ERR unknown command '" + args[0] + "'\r\n";
@@ -157,6 +186,8 @@ int main() {
     int kq = kqueue();
     if (kq < 0) { perror("kqueue"); exit(1); }
     kq_add(kq, listen_fd);
+
+    std::unordered_map<std::string, std::string> store;
 
     // Per-client read buffers. Incomplete RESP data stays here until the
     // rest arrives in a future read().
@@ -208,7 +239,7 @@ int main() {
                 // Incomplete trailing bytes stay in buffers[fd] for next time.
                 std::vector<std::string> args;
                 while (parse_command(buffers[fd], args)) {
-                    std::string resp = handle_command(args);
+                    std::string resp = handle_command(args, store);
                     write(fd, resp.data(), resp.size());
                 }
             }
