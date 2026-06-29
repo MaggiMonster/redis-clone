@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <functional>
+#include <cstddef>
 #include <algorithm>
 #include <cctype>
 
@@ -55,6 +57,177 @@ void kq_remove_and_close(int kq, int fd) {
     kevent(kq, &ev, 1, nullptr, 0, nullptr);
     close(fd);
 }
+// dictionary to store data using incremental hashing to prevent latency spikes.
+struct Entry
+{
+    std::string key;
+    std::string value;
+    Entry *next;
+};
+struct Table
+{
+    std::vector<Entry *> buckets;
+    size_t count;
+};
+struct Dict
+{
+    Table ht[2];
+    long rehash_idx;
+    Dict()
+    {
+        ht[0].buckets.assign(8, nullptr);
+        ht[0].count = 0;
+        rehash_idx = -1;
+    }
+    void rehash_step()
+    {
+        if (rehash_idx == -1)
+            return;
+        Entry *cur = ht[0].buckets[rehash_idx];
+        while (cur != nullptr)
+        {
+            Entry *next = cur->next;
+            size_t i = std::hash<std::string>{}(cur->key) % ht[1].buckets.size();
+            cur->next = ht[1].buckets[i];
+            ht[1].buckets[i] = cur;
+            ht[1].count++;
+            ht[0].count--;
+            cur = next;
+        }
+        ht[0].buckets[rehash_idx] = nullptr;
+        rehash_idx++;
+        if (rehash_idx == (long)ht[0].buckets.size())
+        {
+            ht[0] = ht[1];
+            ht[1] = Table{};
+            rehash_idx = -1;
+        }
+    }
+    Entry *get(const std::string &key)
+    {
+        rehash_step();
+        size_t index = std::hash<std::string>{}(key) % ht[0].buckets.size();
+        Entry *cur = ht[0].buckets[index];
+        while (cur != nullptr)
+        {
+            if (cur->key == key)
+                return cur;
+            cur = cur->next;
+        }
+        if (rehash_idx != -1)
+        {
+            size_t idx = std::hash<std::string>{}(key) % ht[1].buckets.size();
+            Entry *current = ht[1].buckets[idx];
+            while (current != nullptr)
+            {
+                if (current->key == key)
+                    return current;
+                current = current->next;
+            }
+        }
+        return nullptr;
+    }
+    void set(const std::string &key, const std::string &value)
+    {
+        rehash_step();
+        size_t index = std::hash<std::string>{}(key) % ht[0].buckets.size();
+        Entry *cur = ht[0].buckets[index];
+        while (cur != nullptr)
+        {
+            if (cur->key == key)
+            {
+                cur->value = value;
+                return;
+            }
+            cur = cur->next;
+        }
+        if (rehash_idx != -1)
+        {
+            size_t index = std::hash<std::string>{}(key) % ht[1].buckets.size();
+            Entry *cur = ht[1].buckets[index];
+            while (cur != nullptr)
+            {
+                if (cur->key == key)
+                {
+                    cur->value = value;
+                    return;
+                }
+                cur = cur->next;
+            }
+        }
+        Table&t = (rehash_idx==-1)?ht[0]:ht[1];
+        size_t idx=std::hash<std::string>{}(key)%t.buckets.size();
+        Entry *node = new Entry({key, value, t.buckets[idx]});
+        t.buckets[idx] = node;
+        t.count++;
+
+        if (rehash_idx == -1 && ht[0].count >= ht[0].buckets.size())
+        {
+            ht[1].buckets.assign(ht[0].buckets.size() * 2, nullptr);
+            ht[1].count = 0;
+            rehash_idx = 0;
+        }
+        return;
+    }
+    void del(const std::string &key)
+    {
+        rehash_step();
+        size_t index = std::hash<std::string>{}(key) % ht[0].buckets.size();
+        Entry *cur = ht[0].buckets[index];
+        Entry *prev = nullptr;
+        while (cur != nullptr)
+        {
+            if (cur->key == key)
+            {
+                if (prev == nullptr)
+                {
+                    ht[0].buckets[index] = ht[0].buckets[index]->next;
+                    delete cur;
+                    ht[0].count--;
+                    return;
+                }
+                else
+                {
+                    prev->next = cur->next;
+                    delete cur;
+                    ht[0].count--;
+                    return;
+                }
+            }
+            prev = cur;
+            cur = cur->next;
+        }
+        if (rehash_idx != -1)
+        {
+            size_t index = std::hash<std::string>{}(key) % ht[1].buckets.size();
+            Entry *cur = ht[1].buckets[index];
+            Entry *prev = nullptr;
+            while (cur != nullptr)
+            {
+                if (cur->key == key)
+                {
+                    if (prev == nullptr)
+                    {
+                        ht[1].buckets[index] = ht[1].buckets[index]->next;
+                        delete cur;
+                        ht[1].count--;
+                        return;
+                    }
+                    else
+                    {
+                        prev->next = cur->next;
+                        delete cur;
+                        ht[1].count--;
+                        return;
+                    }
+                }
+                prev = cur;
+                cur = cur->next;
+            }
+        }
+    }
+};
+//
 
 // ---------------------------------------------------------------------------
 // RESP parser
@@ -121,8 +294,7 @@ static const std::string OK         = "+OK\r\n";
 // Command dispatcher
 // ---------------------------------------------------------------------------
 
-std::string handle_command(const std::vector<std::string>& args,
-                           std::unordered_map<std::string, std::string>& store) {
+std::string handle_command(const std::vector<std::string>& args, Dict& store) {
     if (args.empty()) return "-ERR empty command\r\n";
 
     std::string cmd = args[0];
@@ -140,15 +312,15 @@ std::string handle_command(const std::vector<std::string>& args,
 
     if (cmd == "SET") {
         if (args.size() < 3) return "-ERR wrong number of arguments for 'set'\r\n";
-        store[args[1]] = args[2];
+        store.set(args[1], args[2]);
         return OK;
     }
 
     if (cmd == "GET") {
         if (args.size() < 2) return "-ERR wrong number of arguments for 'get'\r\n";
-        auto it = store.find(args[1]);
-        if (it == store.end()) return NULL_BULK;
-        return make_bulk(it->second);
+        Entry* e = store.get(args[1]);
+        if (!e) return NULL_BULK;
+        return make_bulk(e->value);
     }
 
     return "-ERR unknown command '" + args[0] + "'\r\n";
@@ -187,7 +359,7 @@ int main() {
     if (kq < 0) { perror("kqueue"); exit(1); }
     kq_add(kq, listen_fd);
 
-    std::unordered_map<std::string, std::string> store;
+    Dict store;
 
     // Per-client read buffers. Incomplete RESP data stays here until the
     // rest arrives in a future read().
