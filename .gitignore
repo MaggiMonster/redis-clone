@@ -3,6 +3,8 @@ server
 nonblocking_server
 kevent_server
 blocking_server
+resp_server
+test_client
 
 # object files / build output
 *.o
