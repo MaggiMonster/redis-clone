@@ -60,9 +60,13 @@ Supported commands:
 |---|---|---|
 | `PING` | `PING [message]` | replies `PONG`, or echoes `message` |
 | `ECHO` | `ECHO message` | |
-| `SET` | `SET key value` | |
-| `GET` | `GET key` | nil bulk reply if the key doesn't exist |
+| `SET` | `SET key value` | clears any existing TTL on the key |
+| `GET` | `GET key` | nil bulk reply if the key doesn't exist (or has expired) |
 | `DEL` | `DEL key` | |
+| `EXPIRE` | `EXPIRE key seconds` | `1` if the key exists, `0` otherwise |
+| `TTL` | `TTL key` | seconds left, `-1` if no TTL, `-2` if the key doesn't exist |
+| `PERSIST` | `PERSIST key` | removes a key's TTL; `1` if it had one, `0` otherwise |
+| `DBSIZE` | `DBSIZE` | number of live keys |
 
 ## Roadmap
 
@@ -72,7 +76,7 @@ Supported commands:
 | 2 | Event loop — `kqueue`, readiness scaling with active connections | done |
 | 3 | RESP protocol — parsing the wire format, command dispatch | done |
 | 4 | Core data store — hash table with incremental rehashing | done |
-| 5 | Expiration — passive + active probabilistic sampling | planned |
+| 5 | Expiration — passive + active probabilistic sampling | done |
 | 6 | Persistence — RDB via `fork()`/copy-on-write, and AOF | planned |
 
 ## Design decisions
@@ -111,6 +115,17 @@ This is the part I actually care about being able to explain:
   `get`/`set`/`del` call instead of migrating everything at once — so no single
   operation ever pays for the full resize. See Benchmarks below for what this
   actually buys in the worst case.
+- **Passive + active expiration, not just one.** Each `Entry` carries its own
+  `expire_at`. Passive expiration — checking and evicting lazily on `GET`,
+  `EXPIRE`, `TTL`, `PERSIST` — is nearly free, but on its own it leaks memory:
+  a key nobody ever accesses again just sits there forever, TTL or not. So the
+  event loop also gives `kevent()` a bounded ~100ms timeout instead of blocking
+  forever, and on every wake — even with zero client I/O — runs a bounded
+  active-expiration pass: sample a handful of random buckets, evict anything
+  expired, and if more than a quarter of the TTL-bearing entries sampled were
+  expired, assume there's more and sample again (capped at a few passes so one
+  tick can never run unbounded work). Same amortized-over-time shape as the
+  rehashing above, applied to a different problem.
 
 ## Benchmarks
 
