@@ -8,9 +8,12 @@ key expiration, and persistence.
 
 ## Why I built this
 
-I wanted to understand how an in-memory data store actually works under the
-hood — not just use one. Each piece is implemented by hand so I can explain the
-trade-offs behind it.
+I've always liked the design choices that show up in systems-level projects —
+the kind of thinking you only run into when you're working close to the OS and
+the network stack instead of a framework on top of them. This was a chance to
+get hands-on with that: sockets, event loops, wire protocols, and the data
+structures underneath a store like Redis. It was a genuinely good way to learn,
+including from the places I got wrong on the first pass.
 
 ## Repo layout
 
@@ -66,6 +69,21 @@ This is the part I actually care about being able to explain:
 - **`SO_REUSEADDR`.** Set defensively so the port can be rebound immediately on
   restart; only strictly needed when a prior connection is lingering in
   `TIME_WAIT`.
+- **Draining the whole accept backlog, not one connection per cycle.** The
+  first non-blocking pass called `accept()` once per event-loop iteration —
+  fine at low load, but under a real connection burst, extras just sit queued
+  in the kernel's backlog until later iterations happen to catch up to them
+  one at a time. Looping `accept()` until it returns `EAGAIN` drains the
+  entire backlog every time the listening socket is readable, so nothing
+  waits longer than it has to.
+- **Not trusting `EV_EOF` as the close signal.** kqueue sets `EV_EOF` on the
+  read filter once the peer sends FIN — but that can be true at the same
+  moment there's still unread data sitting in the socket's receive buffer (a
+  client that writes then closes right away). Closing the connection as soon
+  as `EV_EOF` is set would silently drop that data on a loaded or laggy
+  server. `read()`'s own return value is the only signal actually trusted to
+  mean "done": a `0` only means EOF *after* everything the peer sent has been
+  drained, which is the guarantee that actually matters.
 - **Incremental rehashing.** The hash table (`Dict` in `src/resp_server.cpp`)
   keeps two tables (`ht[0]`, `ht[1])`. Once the load factor hits 1.0, it
   allocates a table at 2x size and migrates exactly one bucket per subsequent
