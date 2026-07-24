@@ -18,8 +18,8 @@ including from the places I got wrong on the first pass.
 ## Repo layout
 
 ```
-src/            server implementations, one per phase, plus the hand-rolled
-                hash table and its test clients
+src/            server implementations, one per phase, the hand-rolled hash
+                table's standalone first draft, and a RESP parser test client
 benchmark/      latency benchmarking tool + results comparing incremental vs.
                 stop-the-world rehashing
 ```
@@ -30,7 +30,10 @@ tinkering with the networking model one step further (blocking sockets, then
 non-blocking with plain `accept()` polling, then `kqueue`, then the full RESP
 protocol on top). `dict.cpp` is the hash table's first draft — built and tested
 standalone with its own `main()` before the same `Dict` was folded into
-`resp_server.cpp` as the real store.
+`resp_server.cpp` as the real store. `test_client.cpp` exists to test the RESP
+parser against a split command: it writes a `PING` across two separate
+`write()` calls with a `sleep()` in between, to confirm the parser correctly
+reassembles a command that arrives in fragments instead of one clean read.
 
 ## Build & run
 
@@ -159,14 +162,14 @@ clang++ -std=c++17 -O2 src/resp_server_naive.cpp -o resp_server_naive
 clang++ -std=c++17 -O2 benchmark/bench_client.cpp -o benchmark/bench_client
 
 ./resp_server &                                          # then, separately:
-./benchmark/bench_client 6379 1000000 incremental.csv
+./benchmark/bench_client 6379 1000000 benchmark/incremental.csv
 kill %1
 
 ./resp_server_naive &
-./benchmark/bench_client 6379 1000000 naive.csv
+./benchmark/bench_client 6379 1000000 benchmark/naive.csv
 kill %1
 
-python3 benchmark/latency_percentiles.py incremental.csv naive.csv
+python3 benchmark/latency_percentiles.py benchmark/incremental.csv benchmark/naive.csv
 ```
 
 ## Notes
