@@ -19,10 +19,18 @@ including from the places I got wrong on the first pass.
 
 ```
 src/            server implementations, one per phase, plus the hand-rolled
-                hash table (embedded in resp_server.cpp) and its test clients
+                hash table and its test clients
 benchmark/      latency benchmarking tool + results comparing incremental vs.
                 stop-the-world rehashing
 ```
+
+`src/` keeps every phase's server rather than overwriting it: `blocking_server.cpp`
+→ `nonblocking_server.cpp` → `kevent_server.cpp` → `resp_server.cpp`, each one
+tinkering with the networking model one step further (blocking sockets, then
+non-blocking with plain `accept()` polling, then `kqueue`, then the full RESP
+protocol on top). `dict.cpp` is the hash table's first draft — built and tested
+standalone with its own `main()` before the same `Dict` was folded into
+`resp_server.cpp` as the real store.
 
 ## Build & run
 
@@ -42,6 +50,16 @@ redis-cli -p 6379 get foo
 ```
 
 (or `nc localhost 6379` and type RESP by hand.)
+
+Supported commands:
+
+| Command | Syntax | Notes |
+|---|---|---|
+| `PING` | `PING [message]` | replies `PONG`, or echoes `message` |
+| `ECHO` | `ECHO message` | |
+| `SET` | `SET key value` | |
+| `GET` | `GET key` | nil bulk reply if the key doesn't exist |
+| `DEL` | `DEL key` | |
 
 ## Roadmap
 
