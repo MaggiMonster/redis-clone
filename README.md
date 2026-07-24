@@ -8,10 +8,10 @@ key expiration, and persistence.
 
 ## Why I built this
 
-I've always liked the design choices that show up in systems-level projects —
-the kind of thinking you only run into when you're working close to the OS and
-the network stack instead of a framework on top of them. This was a chance to
-get hands-on with that: sockets, event loops, wire protocols, and the data
+I liked the design choices that show up in systems-level projects — the kind
+of thinking you only run into when you're working close to the OS and the
+network stack instead of a framework on top of them. This was a chance to get
+hands-on with that: sockets, event loops, wire protocols, and the data
 structures underneath a store like Redis. It was a genuinely good way to learn,
 including from the places I got wrong on the first pass.
 
