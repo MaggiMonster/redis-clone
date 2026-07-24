@@ -1,10 +1,16 @@
-# compiled binary
+# compiled binaries (src/)
 server
 nonblocking_server
 kevent_server
 blocking_server
 resp_server
+resp_server_naive
 test_client
+dict
+!dict.cpp
+
+# compiled binaries (benchmark/)
+bench_client
 
 # object files / build output
 *.o
@@ -14,6 +20,10 @@ test_client
 # build directories
 build/
 cmake-build-*/
+
+# benchmark output (regenerate via benchmark/bench_client + benchmark/latency_percentiles.py)
+benchmark/*.csv
+benchmark/*.png
 
 # macOS
 .DS_Store

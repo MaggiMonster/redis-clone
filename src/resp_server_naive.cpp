@@ -10,7 +10,7 @@
 //   $<len>\r\n<arg>\r\n
 //   ...
 //
-// Build (macOS):  clang++ -std=c++17 resp_server.cpp -o resp_server
+// Build (macOS):  clang++ -std=c++17 -O2 src/resp_server_naive.cpp -o resp_server_naive
 // Run:            ./resp_server
 // Test:           redis-cli -p 6379 ping
 //                 redis-cli -p 6379 echo hello
@@ -168,6 +168,10 @@ struct Dict
             ht[1].buckets.assign(ht[0].buckets.size() * 2, nullptr);
             ht[1].count = 0;
             rehash_idx = 0;
+            while (rehash_idx != -1)
+            {
+                rehash_step();
+            }
         }
         return;
     }
