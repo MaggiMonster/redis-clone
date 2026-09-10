@@ -116,11 +116,15 @@ This is the part I actually care about being able to explain:
   none of it — and says so in its return value. The server used to discard
   that value, which reads as "the reply was sent" and is right up until the
   buffer fills. The pipelining validator in `benchmark/` found it: past
-  ~555KB of queued replies — a constant, measured across command counts and
-  payload sizes, because it's the send buffer, not the workload — every
-  further reply was silently dropped and the client waited forever for
-  answers that no longer existed. Small replies never reach that cliff, which
-  is why ordinary request-response traffic never noticed. Now every reply goes
+  ~555KB of queued replies on this machine — consistent with autoscaled send
+  and receive buffers sitting between the 128KB `net.inet.tcp.sendspace` base
+  and the 4MB autoscaling ceiling, so it is a property of the buffers under
+  that workload rather than a fixed constant you could read off a single
+  sysctl — every further reply was silently dropped and the client waited
+  forever for answers that no longer existed. It held steady across command
+  counts and payload sizes, which is what identified it as the buffer filling
+  rather than anything about the workload. Small replies never reach that
+  cliff, which is why ordinary request-response traffic never noticed. Now every reply goes
   through a per-connection output buffer, flushed as the socket accepts it,
   with `EVFILT_WRITE` armed only while something is actually pending — leaving
   it armed on an empty buffer would spin the loop at 100% CPU, the exact thing
@@ -148,13 +152,41 @@ This is the part I actually care about being able to explain:
 
 ## Benchmarks
 
-All numbers below were measured on an Apple Silicon Mac (macOS) with client and
-server on the **same machine over loopback**. That's deliberate: loopback takes
-the network out of the picture so what's left is the server — its event loop,
-RESP parsing, and data structures. It is *not* a measure of what this would do
-across a real network, where RTT would dominate everything here. Treat these as
-relative numbers for comparing implementation choices against each other, not
-as absolute performance claims.
+All numbers below were measured with client and server on the **same machine
+over loopback**. That's deliberate: loopback takes the network out of the
+picture so what's left is the server — its event loop, RESP parsing, and data
+structures. These measure the server, **not a network path**. Across a real
+network RTT would dominate every number here, so treat these as relative
+figures for comparing implementation choices against each other, not as
+absolute performance claims.
+
+Hardware and toolchain:
+
+| | |
+|---|---|
+| CPU | Apple M4, 10 cores (10 physical / 10 logical, no SMT) |
+| Memory | 16 GB |
+| OS | macOS 15.5 (build 24F74) |
+| Compiler | Apple clang 17.0.0, `arm64-apple-darwin24.5.0`, `-O2` |
+| TCP buffers | `sendspace`/`recvspace` 128 KB base, autoscaling to a 4 MB ceiling |
+
+Methodology for the concurrent and pipelining sweeps below: **5,000,000 ops per
+config, three runs each, reporting the median**. Runs were interleaved (run 1
+of every config, then run 2, then run 3) rather than three-in-a-row, so drift
+over the session spreads across configs instead of landing on one. The server
+is restarted before every run, so no run inherits another's hash table. The
+large-reply regression gate runs first. Run-to-run throughput spread was
+**≤6.6% everywhere** and is quoted per config below.
+
+**† Quote p50 and p99; treat p99.9 as indicative only.** Throughput (≤6.6%) and
+the p50/p99 latencies were stable run to run, but p99.9 swung between roughly
+10% and 78% depending on config — worst at pipelined depth 64, where it ranged
+39,042–70,667 ns across three runs. That is a sample-count artifact, not the
+server behaving erratically: at depth 64, 5,000,000 ops is only 78,125 batches,
+and latency is recorded per batch, so p99.9 is decided by about **78 samples**.
+A handful of scheduler hiccups moves it a long way. The fix would be more
+batches, not a quieter machine, so the figures are left in as shape rather than
+removed — just don't quote them as measurements.
 
 ### Incremental vs. stop-the-world rehashing
 
@@ -232,13 +264,41 @@ per-op round trip, so it *should* climb with connection count — each client is
 queueing behind more work on a single-threaded server — while total throughput
 is the number that matters.
 
-| connections | throughput (ops/sec) | p50 (ns) | p99 (ns) | p99.9 (ns) |
-|---|---|---|---|---|
-| 1 | TBD | TBD | TBD | TBD |
-| 10 | TBD | TBD | TBD | TBD |
-| 50 | TBD | TBD | TBD | TBD |
-| 100 | TBD | TBD | TBD | TBD |
-| 200 | TBD | TBD | TBD | TBD |
+These are **unpipelined** round trips — one command in flight per connection at
+a time.
+
+| connections | throughput (ops/sec) | p50 (ns) | p99 (ns) | p99.9 (ns, indicative†) | run-to-run spread |
+|---|---|---|---|---|---|
+| 1 | 76,910 | 12,250 | 18,792 | 23,167 | 1.7% |
+| 10 | **268,531** | 35,625 | 65,375 | 91,041 | 3.4% |
+| 50 | 259,361 | 169,750 | 361,083 | 429,542 | 4.6% |
+| 100 | 256,916 | 387,125 | 474,917 | 773,458 | 4.7% |
+| 200 | 252,675 | 785,250 | 973,625 | 1,551,500 | 6.6% |
+
+**Reading the shape.** Throughput climbs 3.5x from 1 to 10 connections
+(76.9k → 268.5k), and then stops. **The knee is at 10 connections** — that is
+where this server saturates. Everything past it is flat to very slightly
+declining: 50, 100 and 200 connections land within 6% of the peak, drifting
+down rather than up. Meanwhile latency grows almost exactly in proportion to
+connection count: p50 goes 35.6µs → 169.8µs → 387.1µs → 785.3µs across
+10 → 50 → 100 → 200, roughly 2x per doubling, and p99 follows the same shape.
+
+That is the expected and correct behavior for this architecture, not a
+shortfall. The server is **single-threaded by design** — one `kqueue` loop, no
+locks anywhere, which is what lets the hash table be lock-free and the
+incremental rehashing above be reasoned about at all. Once that single thread
+is busy, additional connections cannot add throughput; they can only queue. So
+work per second flattens and each client's wait grows linearly with how many
+clients are ahead of it. Multiplying throughput past the knee would mean
+sharding the keyspace across threads or processes, which is a different design
+with its own costs — not a tuning knob on this one.
+
+**Caveat on 100 and 200 connections.** The client threads and the server share
+the same 10 cores, so at those counts a meaningful part of what's being
+measured is client-side thread scheduling rather than server capacity.
+**1, 10 and 50 are the clean measurements**; 100 and 200 are directional —
+enough to show the plateau continues and latency keeps scaling, not precise
+figures for server capacity.
 
 ### Pipelining
 
@@ -252,15 +312,45 @@ is protocol overhead rather than actual work. Latency percentiles for this one
 are per *batch*, not per op — a batch at depth 64 doing more work than a batch
 at depth 1 is expected, so batch latency rising with depth is not a regression.
 
-| depth | throughput (ops/sec) | speedup vs. depth 1 | p50 batch (ns) | p99 batch (ns) |
-|---|---|---|---|---|
-| 1 | TBD | 1.00x | TBD | TBD |
-| 2 | TBD | TBD | TBD | TBD |
-| 4 | TBD | TBD | TBD | TBD |
-| 8 | TBD | TBD | TBD | TBD |
-| 16 | TBD | TBD | TBD | TBD |
-| 32 | TBD | TBD | TBD | TBD |
-| 64 | TBD | TBD | TBD | TBD |
+Every throughput figure in this table is **pipelined at the stated depth**, and
+is not comparable to the unpipelined numbers in the concurrent table above
+without that qualifier — they measure different things.
+
+| depth | throughput (ops/sec, pipelined at this depth) | speedup vs. pipelined depth 1 | p50 batch (ns) | p99 batch (ns) | run-to-run spread |
+|---|---|---|---|---|---|
+| 1 | 74,794 | 1.00x | 12,250 | 18,000 | 1.5% |
+| 2 | 148,390 | 1.98x | 12,292 | 18,000 | 0.6% |
+| 4 | 288,686 | 3.86x | 12,500 | 18,042 | 0.5% |
+| 8 | 506,688 | 6.77x | 13,584 | 20,375 | 3.1% |
+| 16 | 922,024 | 12.33x | 14,375 | 21,209 | 1.0% |
+| 32 | 1,433,464 | 19.17x | 17,125 | 23,709 | 1.2% |
+| 64 | **1,912,995** | 25.58x | 23,834 | 31,584 | 1.5% |
+
+Pipelined depth 1 (74,794 ops/sec) lands within noise of the 1-connection
+unpipelined figure (76,910 ops/sec), which is the expected sanity check: at
+depth 1 there is nothing to batch, so pipelining is a no-op.
+
+**What the output-buffer fix changed here.** Measured at the same 5M ops, three
+runs, against the pre-fix server built from the parent commit:
+
+| | pre-fix | post-fix | change |
+|---|---|---|---|
+| pipelined depth 1 | 75,303 | 74,794 | −0.7% (within the 1.5% run-to-run spread) |
+| pipelined depth 64 | 996,904 | 1,912,995 | **1.92x** |
+
+The gain is **syscall amortization, not the server doing less work**. Before the
+fix, each reply in a batch got its own `write()` — 64 syscalls per batch at
+depth 64. After it, replies accumulate in the connection's output buffer and
+the batch is flushed in one pass. Depth 1 is the control: it batches nothing, so
+if the speedup came from cheaper work per command it would have moved too, and
+it didn't.
+
+The pre-fix comparison is valid, i.e. the old number is not inflated by replies
+being silently dropped: at depth 64 the workload is ECHO with short tokens, so
+pending replies peak at **1,088 bytes** (17 bytes per reply x 64) — roughly
+500x below the ~555KB cliff at which the pre-fix server started losing them. Every pre-fix run also passed the
+validator on all 5,000,000 replies, complete and in order, which confirms it
+empirically rather than by argument.
 
 **Correctness.** It's also a parser test, and hard-fails on any violation. The
 default workload is `ECHO` with a unique token per command precisely *because*
