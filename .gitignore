@@ -11,6 +11,8 @@ dict
 
 # compiled binaries (benchmark/)
 bench_client
+bench_concurrent
+bench_pipeline
 
 # object files / build output
 *.o
@@ -21,9 +23,10 @@ bench_client
 build/
 cmake-build-*/
 
-# benchmark output (regenerate via benchmark/bench_client + benchmark/latency_percentiles.py)
+# benchmark output (regenerate via benchmark/run_benchmarks.sh)
 benchmark/*.csv
 benchmark/*.png
+benchmark/results/
 
 # macOS
 .DS_Store

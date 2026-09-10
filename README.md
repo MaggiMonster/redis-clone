@@ -129,6 +129,16 @@ This is the part I actually care about being able to explain:
 
 ## Benchmarks
 
+All numbers below were measured on an Apple Silicon Mac (macOS) with client and
+server on the **same machine over loopback**. That's deliberate: loopback takes
+the network out of the picture so what's left is the server — its event loop,
+RESP parsing, and data structures. It is *not* a measure of what this would do
+across a real network, where RTT would dominate everything here. Treat these as
+relative numbers for comparing implementation choices against each other, not
+as absolute performance claims.
+
+### Incremental vs. stop-the-world rehashing
+
 `src/resp_server_naive.cpp` is a byte-for-byte copy of `resp_server.cpp` with
 one change: the moment a resize triggers, it drains the migration to
 completion synchronously in that same call (stop-the-world), instead of
@@ -185,6 +195,74 @@ kill %1
 kill %1
 
 python3 benchmark/latency_percentiles.py benchmark/incremental.csv benchmark/naive.csv
+```
+
+### Concurrent connections
+
+`benchmark/bench_concurrent.cpp` opens N simultaneous connections, one thread
+each, every connection writing SETs into its own key namespace so they never
+collide. All threads are held at a start gate until every connection is
+established, so the measurement window is genuinely concurrent instead of being
+smeared out by connection setup — `connect()` happens entirely outside the
+timed window.
+
+This is the thing a single-connection benchmark structurally cannot show: with
+one connection the server is never asked to multiplex, so the `kqueue` loop is
+doing nothing the blocking server from Phase 1 couldn't. Latency here is
+per-op round trip, so it *should* climb with connection count — each client is
+queueing behind more work on a single-threaded server — while total throughput
+is the number that matters.
+
+| connections | throughput (ops/sec) | p50 (ns) | p99 (ns) | p99.9 (ns) |
+|---|---|---|---|---|
+| 1 | TBD | TBD | TBD | TBD |
+| 10 | TBD | TBD | TBD | TBD |
+| 50 | TBD | TBD | TBD | TBD |
+| 100 | TBD | TBD | TBD | TBD |
+| 200 | TBD | TBD | TBD | TBD |
+
+### Pipelining
+
+`benchmark/bench_pipeline.cpp` writes `depth` commands back-to-back in a single
+`write()` without waiting for replies, then reads and validates `depth` replies
+before sending the next batch. It exists to test two separate things:
+
+**Throughput.** Pipelining amortizes the per-round-trip syscall and wakeup cost
+over many commands, so this measures how much of the single-connection number
+is protocol overhead rather than actual work. Latency percentiles for this one
+are per *batch*, not per op — a batch at depth 64 doing more work than a batch
+at depth 1 is expected, so batch latency rising with depth is not a regression.
+
+| depth | throughput (ops/sec) | speedup vs. depth 1 | p50 batch (ns) | p99 batch (ns) |
+|---|---|---|---|---|
+| 1 | TBD | 1.00x | TBD | TBD |
+| 2 | TBD | TBD | TBD | TBD |
+| 4 | TBD | TBD | TBD | TBD |
+| 8 | TBD | TBD | TBD | TBD |
+| 16 | TBD | TBD | TBD | TBD |
+| 32 | TBD | TBD | TBD | TBD |
+| 64 | TBD | TBD | TBD | TBD |
+
+**Correctness.** It's also a parser test, and hard-fails on any violation. The
+default workload is `ECHO` with a unique token per command precisely *because*
+every reply is then distinguishable — `SET` replies are all `+OK`, so a
+SET-based test can't tell a reordered batch from a correct one. Each batch is
+checked for exactly `depth` replies, each well-formed, each matching its
+command's token in order, with nothing left over in the buffer afterward
+(which would mean the server produced more replies than commands).
+
+`--adversarial` goes further: it splits each batch's byte stream across many
+small `write()` calls at arbitrary offsets — landing mid-command and
+mid-argument — with a pause between each, forcing the server to hold partial
+parse state across many reads. Throughput is meaningless in that mode and isn't
+reported; it's purely a correctness run.
+
+Reproduce the whole sweep — builds everything, restarts the server before every
+run so no run inherits another's hash table, and cleans up after itself:
+
+```bash
+./benchmark/run_benchmarks.sh
+python3 benchmark/summarize_benchmarks.py
 ```
 
 ## Notes
