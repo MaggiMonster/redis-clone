@@ -13,6 +13,7 @@ dict
 bench_client
 bench_concurrent
 bench_pipeline
+test_large_reply
 
 # object files / build output
 *.o

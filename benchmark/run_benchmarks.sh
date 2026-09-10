@@ -73,7 +73,22 @@ clang++ -std=c++17 -O2 src/resp_server.cpp -o "$SERVER_BIN"
 clang++ -std=c++17 -O2 benchmark/bench_client.cpp -o benchmark/bench_client
 clang++ -std=c++17 -O2 -pthread benchmark/bench_concurrent.cpp -o benchmark/bench_concurrent
 clang++ -std=c++17 -O2 benchmark/bench_pipeline.cpp -o benchmark/bench_pipeline
-echo "built server + 3 benchmark tools"
+clang++ -std=c++17 -O2 benchmark/test_large_reply.cpp -o benchmark/test_large_reply
+echo "built server + 3 benchmark tools + regression test"
+echo
+
+# Correctness gate, before any measuring: pushes far more reply bytes through a
+# single connection than a socket send buffer holds, which is what caught the
+# dropped-reply bug on the output path. If this fails the numbers below are
+# meaningless, so stop here.
+echo "=== regression gate: large pipelined replies ==="
+start_server
+if ! ./benchmark/test_large_reply "$PORT"; then
+    echo
+    echo "REGRESSION: the server is dropping replies — refusing to run the sweeps." >&2
+    exit 1
+fi
+stop_server
 echo
 
 echo "=== concurrent connection sweep (total ops per run: $OPS_TOTAL) ==="

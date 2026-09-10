@@ -60,7 +60,26 @@ void kq_remove_and_close(int kq, int fd)
     struct kevent ev;
     EV_SET(&ev, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
     kevent(kq, &ev, 1, nullptr, 0, nullptr);
-    close(fd);
+    close(fd); // also drops any EVFILT_WRITE registration for this fd
+}
+
+// Writability is only ever registered while a connection actually has bytes
+// waiting. A socket is writable almost all of the time, so an EVFILT_WRITE
+// left armed over an empty buffer would wake the loop continuously and burn a
+// core doing nothing — the same busy-spin the event loop exists to avoid.
+void kq_add_write(int kq, int fd)
+{
+    struct kevent ev;
+    EV_SET(&ev, fd, EVFILT_WRITE, EV_ADD, 0, 0, nullptr);
+    if (kevent(kq, &ev, 1, nullptr, 0, nullptr) < 0)
+        perror("kevent EV_ADD (write)");
+}
+
+void kq_remove_write(int kq, int fd)
+{
+    struct kevent ev;
+    EV_SET(&ev, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    kevent(kq, &ev, 1, nullptr, 0, nullptr);
 }
 // dictionary to store data using incremental hashing to prevent latency spikes.
 struct Entry
@@ -533,6 +552,95 @@ std::string handle_command(const std::vector<std::string> &args, Dict &store)
 }
 
 // ---------------------------------------------------------------------------
+// Per-connection state
+//
+// Replies are never handed straight to write(). On a non-blocking socket
+// write() takes only what currently fits in the kernel send buffer — possibly
+// part of a reply, possibly none of it — and returns how much it took. Ignoring
+// that return value silently destroys everything past the buffer, which is
+// exactly the bug the pipelining benchmark caught: past roughly 555KB of queued
+// replies on this machine, every further reply vanished and the client waited
+// forever for answers that no longer existed.
+//
+// So each connection owns an output buffer, and EVERY reply goes through it.
+// There is deliberately no "buffer is empty, write directly" shortcut: the
+// moment a direct write came up short while anything was still queued, replies
+// would reorder. The buffer is flushed immediately after each batch, so the
+// common case still leaves nothing pending — it just does so correctly.
+// ---------------------------------------------------------------------------
+
+// How many reply bytes may pile up for one client that has stopped reading.
+// It has to be generous, because a client can legitimately run far ahead of
+// itself: a deep pipeline of GETs over large values queues megabytes before
+// the first reply is read, and cutting those clients off would be wrong. It
+// cannot be unbounded either — a client that never reads would grow this until
+// the server dies, which is a memory-exhaustion vector, not a hypothetical.
+// 32MB is the same hard ceiling real Redis applies to pubsub clients through
+// client-output-buffer-limit. Note this is per connection; a global ceiling
+// across all clients would be the next refinement.
+constexpr size_t MAX_OUTPUT_BUFFER_BYTES = 32 * 1024 * 1024;
+
+struct Conn
+{
+    std::string in;      // received bytes not yet parsed into a command
+    std::string out;     // reply bytes the kernel has not accepted yet
+    size_t out_sent = 0; // how much of out has already been flushed
+    bool write_armed = false;
+
+    size_t pending() const { return out.size() - out_sent; }
+};
+
+// Flushes as much pending output as the kernel will take right now. Returns
+// false if the connection is dead and the caller should close it.
+static bool flush_output(int kq, int fd, Conn &c)
+{
+    while (c.out_sent < c.out.size())
+    {
+        ssize_t n = write(fd, c.out.data() + c.out_sent, c.out.size() - c.out_sent);
+        if (n > 0)
+        {
+            c.out_sent += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue; // interrupted before sending anything — just retry
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break; // send buffer is full; the rest waits for EVFILT_WRITE
+        // EPIPE, ECONNRESET, anything else: the peer is gone.
+        return false;
+    }
+
+    if (c.out_sent == c.out.size())
+    {
+        c.out.clear();
+        c.out_sent = 0;
+        if (c.write_armed)
+        {
+            kq_remove_write(kq, fd);
+            c.write_armed = false;
+        }
+    }
+    else
+    {
+        // Drop the already-flushed prefix so a long stall can't grow the
+        // buffer without bound, but only once enough has accumulated to be
+        // worth the copy — erasing on every partial write would make flushing
+        // quadratic in the bytes sent.
+        if (c.out_sent > 64 * 1024)
+        {
+            c.out.erase(0, c.out_sent);
+            c.out_sent = 0;
+        }
+        if (!c.write_armed)
+        {
+            kq_add_write(kq, fd);
+            c.write_armed = true;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -584,9 +692,10 @@ int main()
 
     Dict store;
 
-    // Per-client read buffers. Incomplete RESP data stays here until the
-    // rest arrives in a future read().
-    std::unordered_map<int, std::string> buffers;
+    // Per-client state: incomplete RESP data stays in .in until the rest
+    // arrives in a future read(), and replies the kernel hasn't taken yet stay
+    // in .out until the socket is writable again.
+    std::unordered_map<int, Conn> conns;
 
     struct kevent events[MAX_EVTS];
     std::cout << "listening on 0.0.0.0:" << PORT << '\n';
@@ -617,7 +726,7 @@ int main()
                 std::cerr << "kevent error on fd " << fd << '\n';
                 if (fd != listen_fd)
                 {
-                    buffers.erase(fd);
+                    conns.erase(fd); // drops anything still queued for a dead peer
                     kq_remove_and_close(kq, fd);
                 }
                 continue;
@@ -633,35 +742,76 @@ int main()
                         break;
                     set_nonblocking(client_fd);
                     kq_add(kq, client_fd);
-                    buffers[client_fd] = {};
+                    conns[client_fd] = Conn{};
                     std::cout << "client connected (fd " << client_fd << ")\n";
                 }
+                continue;
             }
-            else
-            {
-                // Append new bytes into the client's buffer.
-                char tmp[4096];
-                ssize_t nr = read(fd, tmp, sizeof(tmp));
-                if (nr > 0)
-                {
-                    buffers[fd].append(tmp, nr);
-                }
-                else if (nr == 0 || (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
-                {
-                    std::cout << "client disconnected (fd " << fd << ")\n";
-                    buffers.erase(fd);
-                    kq_remove_and_close(kq, fd);
-                    continue;
-                }
 
-                // Parse and dispatch every complete command in the buffer.
-                // Incomplete trailing bytes stay in buffers[fd] for next time.
-                std::vector<std::string> args;
-                while (parse_command(buffers[fd], args))
+            auto conn_it = conns.find(fd);
+            if (conn_it == conns.end())
+                continue; // already closed earlier in this same batch of events
+            Conn &c = conn_it->second;
+
+            // The socket drained, so push whatever is still queued.
+            if (events[i].filter == EVFILT_WRITE)
+            {
+                if (!flush_output(kq, fd, c))
                 {
-                    std::string resp = handle_command(args, store);
-                    write(fd, resp.data(), resp.size());
+                    std::cout << "client disconnected while flushing (fd " << fd << ")\n";
+                    conns.erase(fd);
+                    kq_remove_and_close(kq, fd);
                 }
+                continue;
+            }
+
+            // Append new bytes into the client's buffer.
+            char tmp[4096];
+            ssize_t nr = read(fd, tmp, sizeof(tmp));
+            if (nr > 0)
+            {
+                c.in.append(tmp, nr);
+            }
+            else if (nr == 0 || (nr < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+            {
+                // The peer is gone — discard anything still queued rather than
+                // trying to flush it at a socket nobody is reading.
+                std::cout << "client disconnected (fd " << fd << ")\n";
+                conns.erase(fd);
+                kq_remove_and_close(kq, fd);
+                continue;
+            }
+
+            // Parse and dispatch every complete command in the buffer.
+            // Incomplete trailing bytes stay in c.in for next time.
+            std::vector<std::string> args;
+            bool close_conn = false;
+            while (parse_command(c.in, args))
+            {
+                c.out += handle_command(args, store);
+                if (c.pending() > MAX_OUTPUT_BUFFER_BYTES)
+                {
+                    std::cerr << "client fd " << fd << " exceeded the "
+                              << (MAX_OUTPUT_BUFFER_BYTES / (1024 * 1024))
+                              << "MB output buffer limit (not reading its replies);"
+                              << " closing it\n";
+                    close_conn = true;
+                    break;
+                }
+            }
+
+            // One flush per batch: a pipelined burst is answered with a single
+            // pass over the socket rather than a write() per command.
+            if (!close_conn && !flush_output(kq, fd, c))
+            {
+                std::cout << "client disconnected (fd " << fd << ")\n";
+                close_conn = true;
+            }
+
+            if (close_conn)
+            {
+                conns.erase(fd);
+                kq_remove_and_close(kq, fd);
             }
         }
     }

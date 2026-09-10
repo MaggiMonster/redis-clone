@@ -109,6 +109,25 @@ This is the part I actually care about being able to explain:
   server. `read()`'s own return value is the only signal actually trusted to
   mean "done": a `0` only means EOF *after* everything the peer sent has been
   drained, which is the guarantee that actually matters.
+- **Partial writes on a non-blocking socket.** Same lesson as `EV_EOF`, on the
+  way out instead of the way in: trust what the syscall returns, not a side
+  channel that looks equivalent. `write()` on a non-blocking socket takes only
+  what fits in the kernel send buffer right now — maybe part of a reply, maybe
+  none of it — and says so in its return value. The server used to discard
+  that value, which reads as "the reply was sent" and is right up until the
+  buffer fills. The pipelining validator in `benchmark/` found it: past
+  ~555KB of queued replies — a constant, measured across command counts and
+  payload sizes, because it's the send buffer, not the workload — every
+  further reply was silently dropped and the client waited forever for
+  answers that no longer existed. Small replies never reach that cliff, which
+  is why ordinary request-response traffic never noticed. Now every reply goes
+  through a per-connection output buffer, flushed as the socket accepts it,
+  with `EVFILT_WRITE` armed only while something is actually pending — leaving
+  it armed on an empty buffer would spin the loop at 100% CPU, the exact thing
+  the event loop above exists to avoid. That buffer is capped (32MB, per
+  connection) and a client that blows past it gets closed, because an
+  unbounded output buffer is a memory-exhaustion vector: one client that never
+  reads its replies could otherwise take the server down.
 - **Incremental rehashing.** The hash table (`Dict` in `src/resp_server.cpp`)
   keeps two tables (`ht[0]`, `ht[1])`. Once the load factor hits 1.0, it
   allocates a table at 2x size and migrates exactly one bucket per subsequent
